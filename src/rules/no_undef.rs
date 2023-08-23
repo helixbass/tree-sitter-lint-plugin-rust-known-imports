@@ -141,6 +141,9 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                         context.report(violation! {
                             node => reference,
                             message_id => "not_defined",
+                            data => {
+                                name => name,
+                            },
                             fix => |fixer| {
                                 if index != 0 {
                                     return;
