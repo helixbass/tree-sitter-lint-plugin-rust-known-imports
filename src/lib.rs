@@ -1,5 +1,8 @@
+#![allow(non_upper_case_globals)]
+
 use tree_sitter_lint::Plugin;
 
+mod kind;
 mod rules;
 
 use rules::no_undef_rule;
