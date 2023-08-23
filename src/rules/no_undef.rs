@@ -22,6 +22,7 @@ struct KnownImportSpec {
     module: String,
     #[allow(dead_code)]
     kind: KnownImportKind,
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -57,12 +58,18 @@ fn insert_import(
         .filter(|child| child.kind() == UseDeclaration)
         .last();
 
-    let new_use_declaration_text = format!("use {}::{};\n", known_import_spec.module, name);
+    let new_use_declaration_text = match known_import_spec.name.as_ref() {
+        Some(real_name) => format!(
+            "use {}::{{{} as {}}};",
+            known_import_spec.module, real_name, name
+        ),
+        None => format!("use {}::{};", known_import_spec.module, name),
+    };
     match last_existing_top_level_use_declaration {
         Some(last_existing_top_level_use_declaration) => {
             fixer.insert_text_after(
                 last_existing_top_level_use_declaration,
-                new_use_declaration_text,
+                format!("\n{new_use_declaration_text}"),
             );
         }
         None => {
@@ -71,7 +78,7 @@ fn insert_import(
                     .non_comment_named_children(context)
                     .next()
                     .unwrap(),
-                format!("{new_use_declaration_text}\n"),
+                format!("{new_use_declaration_text}\n\n"),
             );
         }
     }
@@ -166,6 +173,15 @@ mod tests {
                 }
             }
         });
+        let index_as_id_options = json!({
+            "known_imports": {
+                "Id": {
+                    "module": "foo",
+                    "kind": "generic_type",
+                    "name": "Index",
+                }
+            }
+        });
         RuleTester::run(
             no_undef_rule(),
             rule_tests! {
@@ -179,7 +195,29 @@ mod tests {
                             }
                         ",
                         options => id_options,
-                    }
+                    },
+                    // imported from somewhere else
+                    {
+                        code => "
+                            use bar::Id;
+
+                            struct Foo {
+                                id: Id<usize>,
+                            }
+                        ",
+                        options => id_options,
+                    },
+                    // alias
+                    {
+                        code => "
+                            use foo::{Index as Id};
+
+                            struct Foo {
+                                id: Id<usize>,
+                            }
+                        ",
+                        options => index_as_id_options,
+                    },
                 ],
                 invalid => [
                     {
@@ -197,7 +235,44 @@ struct Foo {
                         ",
                         options => id_options,
                         errors => 1,
-                    }
+                    },
+                    // existing import
+                    {
+                        code => "\
+use bar::baz;
+
+struct Foo {
+    id: Id<usize>,
+}
+                        ",
+                        output => "\
+use bar::baz;
+use foo::Id;
+
+struct Foo {
+    id: Id<usize>,
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                    // alias
+                    {
+                        code => "\
+struct Foo {
+    id: Id<usize>,
+}
+                        ",
+                        output => "\
+use foo::{Index as Id};
+
+struct Foo {
+    id: Id<usize>,
+}
+                        ",
+                        options => index_as_id_options,
+                        errors => 1,
+                    },
                 ]
             },
         );
