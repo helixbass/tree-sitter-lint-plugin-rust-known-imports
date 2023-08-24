@@ -1,15 +1,17 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use serde::Deserialize;
 use tree_sitter_lint::{
-    rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule,
+    rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
 };
 
 use crate::kind::{
-    GenericType, Identifier, ScopedIdentifier, StructItem, UseAsClause, UseDeclaration, UseList,
+    GenericType, Identifier, ScopedIdentifier, ScopedUseList, StructItem, UseAsClause,
+    UseDeclaration, UseList,
 };
 
 #[derive(Deserialize)]
@@ -20,18 +22,39 @@ struct Options {
 type KnownImports = HashMap<String, KnownImportSpec>;
 
 #[derive(Deserialize)]
-struct KnownImportSpec {
-    module: String,
-    #[allow(dead_code)]
-    kind: KnownImportKind,
-    name: Option<String>,
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum KnownImportSpec {
+    GenericType {
+        module: String,
+        name: Option<String>,
+    },
+    TypeIdentifier {
+        module: String,
+        name: Option<String>,
+    },
+    TraitMethod {
+        module: String,
+        #[serde(rename = "trait")]
+        trait_: String,
+    },
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum KnownImportKind {
-    GenericType,
-    TypeIdentifier,
+impl KnownImportSpec {
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::GenericType { name, .. } => name.as_deref(),
+            Self::TypeIdentifier { name, .. } => name.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn module(&self) -> &str {
+        match self {
+            Self::GenericType { module, .. } => module,
+            Self::TypeIdentifier { module, .. } => module,
+            Self::TraitMethod { module, .. } => module,
+        }
+    }
 }
 
 fn is_use_import(node: Node) -> bool {
@@ -49,6 +72,47 @@ fn is_use_import(node: Node) -> bool {
     }
 }
 
+fn get_use_import_path<'a>(
+    node: Node,
+    source_text_provider: &impl SourceTextProvider<'a>,
+) -> Option<String> {
+    let mut current_node = node;
+    let mut path: Vec<Cow<'_, str>> = vec![current_node.text(source_text_provider)];
+    loop {
+        let parent = current_node.parent().unwrap();
+        match parent.kind() {
+            UseAsClause => {
+                if current_node == parent.field("alias") {
+                    path.pop().unwrap();
+                    path.push(parent.field("path").text(source_text_provider));
+                }
+            }
+            UseList => (),
+            ScopedUseList => {
+                if current_node == parent.field("list") {
+                    if let Some(parent_path) = parent.child_by_field_name("path") {
+                        path.push(parent_path.text(source_text_provider));
+                    }
+                } else {
+                    return None;
+                }
+            }
+            ScopedIdentifier => {
+                if current_node == parent.field("name") {
+                    if let Some(parent_path) = parent.child_by_field_name("path") {
+                        path.push(parent_path.text(source_text_provider));
+                    }
+                } else {
+                    return None;
+                }
+            }
+            UseDeclaration => return Some(path.into_iter().rev().collect::<Vec<_>>().join("::")),
+            _ => return None,
+        }
+        current_node = parent;
+    }
+}
+
 fn insert_import(
     fixer: &mut Fixer,
     name: &str,
@@ -61,12 +125,19 @@ fn insert_import(
         .filter(|child| child.kind() == UseDeclaration)
         .last();
 
-    let new_use_declaration_text = match known_import_spec.name.as_ref() {
+    let name_to_import = match known_import_spec {
+        KnownImportSpec::TraitMethod { trait_, .. } => trait_,
+        _ => name,
+    };
+
+    let new_use_declaration_text = match known_import_spec.name() {
         Some(real_name) => format!(
             "use {}::{{{} as {}}};",
-            known_import_spec.module, real_name, name
+            known_import_spec.module(),
+            real_name,
+            name_to_import
         ),
-        None => format!("use {}::{};", known_import_spec.module, name),
+        None => format!("use {}::{};", known_import_spec.module(), name_to_import),
     };
     match last_existing_top_level_use_declaration {
         Some(last_existing_top_level_use_declaration) => {
@@ -110,22 +181,38 @@ fn is_beginning_of_path(node: Node) -> bool {
 }
 
 pub fn no_undef_rule() -> Arc<dyn Rule> {
+    type FullTraitPath = String;
+
     rule! {
         name => "no-undef",
         fixable => true,
         messages => [
             "not_defined" => "'{{name}}' is not defined.",
+            "trait_not_in_scope" => "'{{name}}' is not in scope.",
         ],
         languages => [Rust],
         options_type! => Options,
         state => {
             [per-run]
+            known_traits: HashMap<String, Vec<FullTraitPath>> = {
+                let mut known_traits: HashMap<String, Vec<FullTraitPath>> = Default::default();
+
+                for known_import in options.known_imports.values() {
+                    if let KnownImportSpec::TraitMethod { trait_, module, .. } = known_import {
+                        known_traits.entry(trait_.clone()).or_default().push(format!("{}::{}", module, trait_));
+                    }
+                }
+
+                known_traits
+            },
             known_imports: KnownImports = options.known_imports,
 
             [per-file-run]
             defined_known_imports: HashSet<String>,
             imported_known_imports: HashMap<String, Node<'a>>,
+            imported_known_traits: HashMap<FullTraitPath, Node<'a>>,
             referenced_known_imports: HashMap<String, Vec<Node<'a>>>,
+            referenced_known_traits: HashMap<FullTraitPath, Vec<Node<'a>>>,
         },
         listeners => [
             "
@@ -141,7 +228,10 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                     return;
                 }
 
-                if known_import.kind == KnownImportKind::GenericType && node.parent().unwrap().kind() != GenericType {
+                if matches!(
+                    known_import,
+                    KnownImportSpec::GenericType { .. }
+                ) && node.parent().unwrap().kind() != GenericType {
                     return;
                 }
 
@@ -153,6 +243,17 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
               (identifier) @c
             " => |node, context| {
                 let name = node.text(context);
+                if let Some(known_trait_imports) = self.known_traits.get(&*name) {
+                    if let Some(full_imported_path) = get_use_import_path(node, context) {
+                        if known_trait_imports.contains(&full_imported_path) {
+                            self.imported_known_traits.insert(
+                                full_imported_path,
+                                node,
+                            );
+                        }
+                    }
+                }
+
                 if !self.known_imports.contains_key(&*name) {
                     return;
                 };
@@ -167,6 +268,23 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                         .or_default()
                         .push(node);
                 }
+            },
+            "
+              (call_expression
+                function: (field_expression
+                  field: (field_identifier) @c
+                )
+              )
+            " => |node, context| {
+                let method_name = node.text(context);
+
+                let Some(KnownImportSpec::TraitMethod { module, trait_ }) = self.known_imports.get(&*method_name) else {
+                    return;
+                };
+
+                let full_trait_path = format!("{module}::{trait_}");
+
+                self.referenced_known_traits.entry(full_trait_path).or_default().push(node);
             },
             "source_file:exit" => |node, context| {
                 self.referenced_known_imports.iter().filter(|(referenced_known_import, _)| {
@@ -190,6 +308,27 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                         });
                     }
                 });
+
+                self.referenced_known_traits.iter().filter(|(referenced_known_trait, _)| {
+                    !self.imported_known_traits.contains_key(*referenced_known_trait)
+                }).for_each(|(name, references)| {
+                    for (index, &reference) in references.iter().enumerate() {
+                        context.report(violation! {
+                            node => reference,
+                            message_id => "trait_not_in_scope",
+                            data => {
+                                name => name,
+                            },
+                            fix => |fixer| {
+                                if index != 0 {
+                                    return;
+                                }
+
+                                insert_import(fixer, name, &self.known_imports[&*reference.text(context)], node, context);
+                            }
+                        });
+                    }
+                });
             }
         ]
     }
@@ -200,7 +339,10 @@ mod tests {
     use super::*;
 
     use serde_json::json;
-    use tree_sitter_lint::{rule_tests, RuleTester};
+    use tree_sitter_lint::{
+        get_tokens, rule_tests, tree_sitter::Parser, tree_sitter_grep::SupportedLanguage,
+        RuleTester,
+    };
 
     #[test]
     fn test_generic_type() {
@@ -443,5 +585,125 @@ let x = Id::Something;
                 ]
             },
         );
+    }
+
+    #[test]
+    fn test_trait_method() {
+        let trait_method_options = json!({
+            "known_imports": {
+                "method": {
+                    "module": "foo",
+                    "kind": "trait_method",
+                    "trait": "Trait",
+                }
+            }
+        });
+        RuleTester::run(
+            no_undef_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::Trait;
+
+                            fn whee() {
+                                x.method();
+                            }
+                        ",
+                        options => trait_method_options,
+                    },
+                    // alias
+                    {
+                        code => "
+                            use foo::{Trait as _};
+
+                            fn whee() {
+                                x.method();
+                            }
+                        ",
+                        options => trait_method_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+fn whee() {
+    x.method();
+}
+                        ",
+                        output => "\
+use foo::Trait;
+
+fn whee() {
+    x.method();
+}
+                        ",
+                        options => trait_method_options,
+                        errors => 1,
+                    },
+                    // same name imported from somewhere else
+                    {
+                        code => "\
+use bar::Trait;
+
+fn whee() {
+    x.method();
+}
+                        ",
+                        output => "\
+use bar::Trait;
+use foo::Trait;
+
+fn whee() {
+    x.method();
+}
+                        ",
+                        options => trait_method_options,
+                        errors => 1,
+                    },
+                ]
+            },
+        );
+    }
+
+    fn find_identifier<'a>(root_node: Node<'a>, identifier: &str, text: &[u8]) -> Node<'a> {
+        get_tokens(root_node)
+            .find(|node| node.text(&text) == identifier)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_get_use_import_path() {
+        [
+            ("use bar;", "bar"),
+            ("use foo::bar;", "foo::bar"),
+            ("use foo as bar;", "foo"),
+            ("use foo::baz as bar;", "foo::baz"),
+            ("use {foo as bar};", "foo"),
+            ("use {foo::baz as bar};", "foo::baz"),
+            ("use foo::{bar};", "foo::bar"),
+            ("use foo::{baz as bar};", "foo::baz"),
+            ("use foo::baz::bar;", "foo::baz::bar"),
+            ("use foo::{baz::bar};", "foo::baz::bar"),
+            ("use foo::{bar as baz};", "foo::bar"),
+            ("use foo::bar as baz;", "foo::bar"),
+        ]
+        .into_iter()
+        .for_each(|(code, path)| {
+            let mut parser = Parser::new();
+            parser
+                .set_language(SupportedLanguage::Rust.language())
+                .unwrap();
+            let tree = parser.parse(code, None).unwrap();
+            assert_eq!(
+                get_use_import_path(
+                    find_identifier(tree.root_node(), "bar", code.as_bytes()),
+                    &code.as_bytes()
+                )
+                .as_deref(),
+                Some(path),
+                "Expected '{path}' for '{code}'",
+            );
+        });
     }
 }
