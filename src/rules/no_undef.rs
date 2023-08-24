@@ -11,7 +11,7 @@ use tree_sitter_lint::{
 
 use crate::kind::{
     GenericType, Identifier, ScopedIdentifier, ScopedUseList, StructItem, UseAsClause,
-    UseDeclaration, UseList,
+    UseDeclaration, UseList, Attribute, TokenTree,
 };
 
 #[derive(Deserialize)]
@@ -180,6 +180,19 @@ fn is_beginning_of_path(node: Node) -> bool {
     false
 }
 
+fn is_in_attribute_value(node: Node, context: &QueryMatchContext) -> bool {
+    let mut current_node = node;
+    loop {
+        let parent = current_node.parent().unwrap();
+        match parent.kind() {
+            TokenTree => (),
+            Attribute => return parent.first_non_comment_named_child(context) != current_node,
+            _ => return false,
+        }
+        current_node = parent;
+    }
+}
+
 pub fn no_undef_rule() -> Arc<dyn Rule> {
     type FullTraitPath = String;
 
@@ -263,7 +276,8 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                     return;
                 }
 
-                if is_beginning_of_path(node) {
+                if is_beginning_of_path(node) || is_in_attribute_value(node, context)
+                {
                     self.referenced_known_imports.entry(name.into_owned())
                         .or_default()
                         .push(node);
@@ -705,5 +719,49 @@ fn whee() {
                 "Expected '{path}' for '{code}'",
             );
         });
+    }
+
+    #[test]
+    fn test_derive() {
+        let id_options = json!({
+            "known_imports": {
+                "Id": {
+                    "module": "foo",
+                    "kind": "type_identifier",
+                }
+            }
+        });
+        RuleTester::run(
+            no_undef_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::Id;
+
+                            #[derive(Id)]
+                            struct Foo {}
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+#[derive(Id)]
+struct Foo {}
+                        ",
+                        output => "\
+use foo::Id;
+
+#[derive(Id)]
+struct Foo {}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+        );
     }
 }
