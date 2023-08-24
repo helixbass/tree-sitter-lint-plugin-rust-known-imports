@@ -1,4 +1,5 @@
 pub const GenericType: &str = "generic_type";
+pub const Identifier: &str = "identifier";
 pub const ScopedIdentifier: &str = "scoped_identifier";
 pub const StructItem: &str = "struct_item";
 pub const UseAsClause: &str = "use_as_clause";

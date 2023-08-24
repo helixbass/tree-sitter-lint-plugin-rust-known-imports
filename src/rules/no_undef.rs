@@ -9,7 +9,7 @@ use tree_sitter_lint::{
 };
 
 use crate::kind::{
-    GenericType, ScopedIdentifier, StructItem, UseAsClause, UseDeclaration, UseList,
+    GenericType, Identifier, ScopedIdentifier, StructItem, UseAsClause, UseDeclaration, UseList,
 };
 
 #[derive(Deserialize)]
@@ -95,6 +95,20 @@ fn is_type_definition(node: Node) -> bool {
     }
 }
 
+fn is_beginning_of_path(node: Node) -> bool {
+    let mut current_node = node;
+    while current_node.kind() == Identifier {
+        let parent = current_node.parent().unwrap();
+        if parent.kind() == ScopedIdentifier
+            && parent.child_by_field_name("path") == Some(current_node)
+        {
+            return true;
+        }
+        current_node = parent;
+    }
+    false
+}
+
 pub fn no_undef_rule() -> Arc<dyn Rule> {
     rule! {
         name => "no-undef",
@@ -138,16 +152,21 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
             "
               (identifier) @c
             " => |node, context| {
-                if !is_use_import(node) {
-                    return;
-                }
-
                 let name = node.text(context);
                 if !self.known_imports.contains_key(&*name) {
                     return;
                 };
 
-                self.imported_known_imports.insert(name.into_owned(), node);
+                if is_use_import(node) {
+                    self.imported_known_imports.insert(name.into_owned(), node);
+                    return;
+                }
+
+                if is_beginning_of_path(node) {
+                    self.referenced_known_imports.entry(name.into_owned())
+                        .or_default()
+                        .push(node);
+                }
             },
             "source_file:exit" => |node, context| {
                 self.referenced_known_imports.iter().filter(|(referenced_known_import, _)| {
@@ -406,6 +425,19 @@ struct Foo {
 }
                         ",
                         options => index_as_id_options,
+                        errors => 1,
+                    },
+                    // scoped identifier
+                    {
+                        code => "\
+let x = Id::Something;
+                        ",
+                        output => "\
+use foo::Id;
+
+let x = Id::Something;
+                        ",
+                        options => id_options,
                         errors => 1,
                     },
                 ]
