@@ -8,7 +8,9 @@ use tree_sitter_lint::{
     rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule,
 };
 
-use crate::kind::{GenericType, ScopedIdentifier, UseAsClause, UseDeclaration, UseList};
+use crate::kind::{
+    GenericType, ScopedIdentifier, StructItem, UseAsClause, UseDeclaration, UseList,
+};
 
 #[derive(Deserialize)]
 struct Options {
@@ -25,10 +27,11 @@ struct KnownImportSpec {
     name: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum KnownImportKind {
     GenericType,
+    TypeIdentifier,
 }
 
 fn is_use_import(node: Node) -> bool {
@@ -84,6 +87,14 @@ fn insert_import(
     }
 }
 
+fn is_type_definition(node: Node) -> bool {
+    let parent = node.parent().unwrap();
+    match parent.kind() {
+        StructItem => parent.field("name") == node,
+        _ => false,
+    }
+}
+
 pub fn no_undef_rule() -> Arc<dyn Rule> {
     rule! {
         name => "no-undef",
@@ -98,19 +109,25 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
             known_imports: KnownImports = options.known_imports,
 
             [per-file-run]
-            imported_known_imports: HashSet<String>,
+            defined_known_imports: HashSet<String>,
+            imported_known_imports: HashMap<String, Node<'a>>,
             referenced_known_imports: HashMap<String, Vec<Node<'a>>>,
         },
         listeners => [
             "
               (type_identifier) @c
             " => |node, context| {
-                if node.parent().unwrap().kind() != GenericType {
+                let name = node.text(context);
+                let Some(known_import) = self.known_imports.get(&*name) else {
+                    return;
+                };
+
+                if is_type_definition(node) {
+                    self.defined_known_imports.insert(name.into_owned());
                     return;
                 }
 
-                let name = node.text(context);
-                if !self.known_imports.contains_key(&*name) {
+                if known_import.kind == KnownImportKind::GenericType && node.parent().unwrap().kind() != GenericType {
                     return;
                 }
 
@@ -130,12 +147,12 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                     return;
                 };
 
-
-                self.imported_known_imports.insert(name.into_owned());
+                self.imported_known_imports.insert(name.into_owned(), node);
             },
             "source_file:exit" => |node, context| {
                 self.referenced_known_imports.iter().filter(|(referenced_known_import, _)| {
-                    !self.imported_known_imports.contains(*referenced_known_import)
+                    !self.defined_known_imports.contains(*referenced_known_import) &&
+                        !self.imported_known_imports.contains_key(*referenced_known_import)
                 }).for_each(|(name, references)| {
                     for (index, &reference) in references.iter().enumerate() {
                         context.report(violation! {
@@ -271,6 +288,121 @@ use foo::{Index as Id};
 
 struct Foo {
     id: Id<usize>,
+}
+                        ",
+                        options => index_as_id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+        );
+    }
+
+    #[test]
+    fn test_simple_type() {
+        let id_options = json!({
+            "known_imports": {
+                "Id": {
+                    "module": "foo",
+                    "kind": "type_identifier",
+                }
+            }
+        });
+        let index_as_id_options = json!({
+            "known_imports": {
+                "Id": {
+                    "module": "foo",
+                    "kind": "type_identifier",
+                    "name": "Index",
+                }
+            }
+        });
+        RuleTester::run(
+            no_undef_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::Id;
+
+                            struct Foo {
+                                id: Id,
+                            }
+                        ",
+                        options => id_options,
+                    },
+                    // imported from somewhere else
+                    {
+                        code => "
+                            use bar::Id;
+
+                            struct Foo {
+                                id: Id,
+                            }
+                        ",
+                        options => id_options,
+                    },
+                    // alias
+                    {
+                        code => "
+                            use foo::{Index as Id};
+
+                            struct Foo {
+                                id: Id,
+                            }
+                        ",
+                        options => index_as_id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+struct Foo {
+    id: Id,
+}
+                        ",
+                        output => "\
+use foo::Id;
+
+struct Foo {
+    id: Id,
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                    // existing import
+                    {
+                        code => "\
+use bar::baz;
+
+struct Foo {
+    id: Id,
+}
+                        ",
+                        output => "\
+use bar::baz;
+use foo::Id;
+
+struct Foo {
+    id: Id,
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                    // alias
+                    {
+                        code => "\
+struct Foo {
+    id: Id,
+}
+                        ",
+                        output => "\
+use foo::{Index as Id};
+
+struct Foo {
+    id: Id,
 }
                         ",
                         options => index_as_id_options,
