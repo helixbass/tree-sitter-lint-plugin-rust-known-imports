@@ -216,6 +216,7 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
             "trait_not_in_scope" => "'{{name}}' is not in scope.",
         ],
         languages => [Rust],
+        concatenate_adjacent_insert_fixes => true,
         options_type! => Options,
         state => {
             [per-run]
@@ -830,6 +831,63 @@ fn whee() {
                         ",
                         options => id_options,
                         errors => 1,
+                    },
+                ]
+            },
+        );
+    }
+
+    #[test]
+    fn test_multiple_fixes() {
+        let id_options = json!({
+            "known_imports": {
+                "Id": {
+                    "module": "foo",
+                    "kind": "type_identifier",
+                },
+                "Idz": {
+                    "module": "bar",
+                    "kind": "type_identifier",
+                },
+            }
+        });
+        RuleTester::run(
+            no_undef_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::Id;
+                            use bar::Idz;
+
+                            struct Foo {
+                                id: Id,
+                                idz: Idz,
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+struct Foo {
+    id: Id,
+    idz: Idz,
+}
+                        ",
+                        output => "\
+use foo::Id;
+
+use bar::Idz;
+
+struct Foo {
+    id: Id,
+    idz: Idz,
+}
+                        ",
+                        options => id_options,
+                        errors => 2,
                     },
                 ]
             },
