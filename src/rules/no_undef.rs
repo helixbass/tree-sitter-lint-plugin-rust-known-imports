@@ -6,12 +6,12 @@ use std::{
 
 use serde::Deserialize;
 use tree_sitter_lint::{
-    rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
+    rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider, squalid::EverythingExt,
 };
 
 use crate::kind::{
     GenericType, Identifier, ScopedIdentifier, ScopedUseList, StructItem, UseAsClause,
-    UseDeclaration, UseList, Attribute, TokenTree,
+    UseDeclaration, UseList, Attribute, TokenTree, MacroInvocation,
 };
 
 #[derive(Deserialize)]
@@ -37,6 +37,10 @@ enum KnownImportSpec {
         #[serde(rename = "trait")]
         trait_: String,
     },
+    Macro {
+        module: String,
+        name: Option<String>,
+    },
 }
 
 impl KnownImportSpec {
@@ -44,6 +48,7 @@ impl KnownImportSpec {
         match self {
             Self::GenericType { name, .. } => name.as_deref(),
             Self::TypeIdentifier { name, .. } => name.as_deref(),
+            Self::Macro { name, .. } => name.as_deref(),
             _ => None,
         }
     }
@@ -53,6 +58,7 @@ impl KnownImportSpec {
             Self::GenericType { module, .. } => module,
             Self::TypeIdentifier { module, .. } => module,
             Self::TraitMethod { module, .. } => module,
+            Self::Macro { module, .. } => module,
         }
     }
 }
@@ -193,6 +199,12 @@ fn is_in_attribute_value(node: Node, context: &QueryMatchContext) -> bool {
     }
 }
 
+fn is_macro_invocation_name(node: Node) -> bool {
+    node.parent().unwrap().thrush(|parent| {
+        parent.kind() == MacroInvocation && node == parent.field("macro")
+    })
+}
+
 pub fn no_undef_rule() -> Arc<dyn Rule> {
     type FullTraitPath = String;
 
@@ -267,7 +279,7 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                     }
                 }
 
-                if !self.known_imports.contains_key(&*name) {
+                let Some(known_import) = self.known_imports.get(&*name) else {
                     return;
                 };
 
@@ -276,11 +288,23 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                     return;
                 }
 
-                if is_beginning_of_path(node) || is_in_attribute_value(node, context)
-                {
-                    self.referenced_known_imports.entry(name.into_owned())
-                        .or_default()
-                        .push(node);
+                match known_import {
+                    KnownImportSpec::Macro { .. } => {
+                        if is_macro_invocation_name(node)
+                        {
+                            self.referenced_known_imports.entry(name.into_owned())
+                                .or_default()
+                                .push(node);
+                        }
+                    }
+                    _ => {
+                        if is_beginning_of_path(node) || is_in_attribute_value(node, context)
+                        {
+                            self.referenced_known_imports.entry(name.into_owned())
+                                .or_default()
+                                .push(node);
+                        }
+                    }
                 }
             },
             "
@@ -756,6 +780,53 @@ use foo::Id;
 
 #[derive(Id)]
 struct Foo {}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+        );
+    }
+
+    #[test]
+    fn test_macro() {
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "macro",
+                }
+            }
+        });
+        RuleTester::run(
+            no_undef_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::id;
+
+                            fn whee() {
+                                id!();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+fn whee() {
+    id!();
+}
+                        ",
+                        output => "\
+use foo::id;
+
+fn whee() {
+    id!();
+}
                         ",
                         options => id_options,
                         errors => 1,
