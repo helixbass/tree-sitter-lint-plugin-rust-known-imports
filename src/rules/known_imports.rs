@@ -4,9 +4,10 @@ use std::{
     sync::Arc,
 };
 
+use itertools::Itertools;
 use serde::Deserialize;
 use tree_sitter_lint::{
-    rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider, squalid::EverythingExt,
+    rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider, squalid::{EverythingExt, VecExt},
 };
 
 use crate::kind::{
@@ -205,11 +206,11 @@ fn is_macro_invocation_name(node: Node) -> bool {
     })
 }
 
-pub fn no_undef_rule() -> Arc<dyn Rule> {
+pub fn known_imports_rule() -> Arc<dyn Rule> {
     type FullTraitPath = String;
 
     rule! {
-        name => "no-undef",
+        name => "known-imports",
         fixable => true,
         messages => [
             "not_defined" => "'{{name}}' is not defined.",
@@ -329,7 +330,9 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
                 self.referenced_known_imports.iter().filter(|(referenced_known_import, _)| {
                     !self.defined_known_imports.contains(*referenced_known_import) &&
                         !self.imported_known_imports.contains_key(*referenced_known_import)
-                }).for_each(|(name, references)| {
+                }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
+                    references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
+                }).into_iter().for_each(|(name, references)| {
                     for (index, &reference) in references.iter().enumerate() {
                         context.report(violation! {
                             node => reference,
@@ -350,7 +353,9 @@ pub fn no_undef_rule() -> Arc<dyn Rule> {
 
                 self.referenced_known_traits.iter().filter(|(referenced_known_trait, _)| {
                     !self.imported_known_traits.contains_key(*referenced_known_trait)
-                }).for_each(|(name, references)| {
+                }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
+                    references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
+                }).into_iter().for_each(|(name, references)| {
                     for (index, &reference) in references.iter().enumerate() {
                         context.report(violation! {
                             node => reference,
@@ -403,7 +408,7 @@ mod tests {
             }
         });
         RuleTester::run(
-            no_undef_rule(),
+            known_imports_rule(),
             rule_tests! {
                 valid => [
                     {
@@ -518,7 +523,7 @@ struct Foo {
             }
         });
         RuleTester::run(
-            no_undef_rule(),
+            known_imports_rule(),
             rule_tests! {
                 valid => [
                     {
@@ -638,7 +643,7 @@ let x = Id::Something;
             }
         });
         RuleTester::run(
-            no_undef_rule(),
+            known_imports_rule(),
             rule_tests! {
                 valid => [
                     {
@@ -757,7 +762,7 @@ fn whee() {
             }
         });
         RuleTester::run(
-            no_undef_rule(),
+            known_imports_rule(),
             rule_tests! {
                 valid => [
                     {
@@ -801,7 +806,7 @@ struct Foo {}
             }
         });
         RuleTester::run(
-            no_undef_rule(),
+            known_imports_rule(),
             rule_tests! {
                 valid => [
                     {
@@ -852,7 +857,7 @@ fn whee() {
             }
         });
         RuleTester::run(
-            no_undef_rule(),
+            known_imports_rule(),
             rule_tests! {
                 valid => [
                     {

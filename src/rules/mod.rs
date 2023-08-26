@@ -1,3 +1,3 @@
-mod no_undef;
+mod known_imports;
 
-pub use no_undef::no_undef_rule;
+pub use known_imports::known_imports_rule;
