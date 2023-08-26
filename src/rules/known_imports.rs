@@ -7,12 +7,15 @@ use std::{
 use itertools::Itertools;
 use serde::Deserialize;
 use tree_sitter_lint::{
-    rule, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider, squalid::{EverythingExt, VecExt},
+    rule,
+    squalid::{EverythingExt, VecExt},
+    tree_sitter::Node,
+    violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
 };
 
 use crate::kind::{
-    GenericType, Identifier, ScopedIdentifier, ScopedUseList, StructItem, UseAsClause,
-    UseDeclaration, UseList, Attribute, TokenTree, MacroInvocation,
+    Attribute, GenericType, Identifier, MacroInvocation, ScopedIdentifier, ScopedUseList,
+    StructItem, TokenTree, UseAsClause, UseDeclaration, UseList,
 };
 
 #[derive(Deserialize)]
@@ -42,6 +45,10 @@ enum KnownImportSpec {
         module: String,
         name: Option<String>,
     },
+    Attribute {
+        module: String,
+        name: Option<String>,
+    },
 }
 
 impl KnownImportSpec {
@@ -50,6 +57,7 @@ impl KnownImportSpec {
             Self::GenericType { name, .. } => name.as_deref(),
             Self::TypeIdentifier { name, .. } => name.as_deref(),
             Self::Macro { name, .. } => name.as_deref(),
+            Self::Attribute { name, .. } => name.as_deref(),
             _ => None,
         }
     }
@@ -60,6 +68,7 @@ impl KnownImportSpec {
             Self::TypeIdentifier { module, .. } => module,
             Self::TraitMethod { module, .. } => module,
             Self::Macro { module, .. } => module,
+            Self::Attribute { module, .. } => module,
         }
     }
 }
@@ -201,8 +210,14 @@ fn is_in_attribute_value(node: Node, context: &QueryMatchContext) -> bool {
 }
 
 fn is_macro_invocation_name(node: Node) -> bool {
+    node.parent()
+        .unwrap()
+        .thrush(|parent| parent.kind() == MacroInvocation && node == parent.field("macro"))
+}
+
+fn is_attribute(node: Node, context: &QueryMatchContext) -> bool {
     node.parent().unwrap().thrush(|parent| {
-        parent.kind() == MacroInvocation && node == parent.field("macro")
+        parent.kind() == Attribute && parent.first_non_comment_named_child(context) == node
     })
 }
 
@@ -293,6 +308,14 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
                 match known_import {
                     KnownImportSpec::Macro { .. } => {
                         if is_macro_invocation_name(node)
+                        {
+                            self.referenced_known_imports.entry(name.into_owned())
+                                .or_default()
+                                .push(node);
+                        }
+                    }
+                    KnownImportSpec::Attribute { .. } => {
+                        if is_attribute(node, context)
                         {
                             self.referenced_known_imports.entry(name.into_owned())
                                 .or_default()
@@ -893,6 +916,50 @@ struct Foo {
                         ",
                         options => id_options,
                         errors => 2,
+                    },
+                ]
+            },
+        );
+    }
+
+    #[test]
+    fn test_attribute() {
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "attribute",
+                }
+            }
+        });
+        RuleTester::run(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::id;
+
+                            #[id]
+                            fn whee() {}
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+#[id]
+fn whee() {}
+                        ",
+                        output => "\
+use foo::id;
+
+#[id]
+fn whee() {}
+                        ",
+                        options => id_options,
+                        errors => 1,
                     },
                 ]
             },
