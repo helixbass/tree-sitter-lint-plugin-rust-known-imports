@@ -9,7 +9,12 @@ edition = "2021"
 itertools = "0.11.0"
 serde = { version = "1.0.185", features = ["derive"] }
 serde_json = "1.0.105"
+tracing = "0.1.37"
 tree-sitter-lint = { path = "../tree-sitter-lint" }
+tree-sitter-lint-plugin-rust-scope-analysis = { path = "../tree-sitter-lint-plugin-rust-scope-analysis" }
 
 [patch.crates-io]
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "c16b90d" }
+
+[dev-dependencies]
+tracing-subscriber = "0.3.17"

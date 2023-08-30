@@ -12,6 +12,7 @@ use tree_sitter_lint::{
     tree_sitter::Node,
     violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
 };
+use tree_sitter_lint_plugin_rust_scope_analysis::{ScopeAnalyzer, Reference, UsageKind};
 
 use crate::kind::{
     Attribute, GenericType, Identifier, MacroInvocation, ScopedIdentifier, ScopedUseList,
@@ -28,10 +29,6 @@ type KnownImports = HashMap<String, KnownImportSpec>;
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum KnownImportSpec {
-    GenericType {
-        module: String,
-        name: Option<String>,
-    },
     TypeIdentifier {
         module: String,
         name: Option<String>,
@@ -54,7 +51,6 @@ enum KnownImportSpec {
 impl KnownImportSpec {
     pub fn name(&self) -> Option<&str> {
         match self {
-            Self::GenericType { name, .. } => name.as_deref(),
             Self::TypeIdentifier { name, .. } => name.as_deref(),
             Self::Macro { name, .. } => name.as_deref(),
             Self::Attribute { name, .. } => name.as_deref(),
@@ -64,7 +60,6 @@ impl KnownImportSpec {
 
     pub fn module(&self) -> &str {
         match self {
-            Self::GenericType { module, .. } => module,
             Self::TypeIdentifier { module, .. } => module,
             Self::TraitMethod { module, .. } => module,
             Self::Macro { module, .. } => module,
@@ -221,6 +216,17 @@ fn is_attribute(node: Node, context: &QueryMatchContext) -> bool {
     })
 }
 
+fn is_compatible_usage_kind(
+    reference: &Reference,
+    known_import: &KnownImportSpec,
+) -> bool {
+    match (reference.usage_kind(), known_import) {
+        (UsageKind::IdentifierReference, KnownImportSpec::TypeIdentifier { .. }) => true,
+        (UsageKind::AttributeName, KnownImportSpec::Attribute { .. }) => true,
+        _ => false,
+    }
+}
+
 pub fn known_imports_rule() -> Arc<dyn Rule> {
     type FullTraitPath = String;
 
@@ -258,81 +264,6 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
         },
         listeners => [
             "
-              (type_identifier) @c
-            " => |node, context| {
-                let name = node.text(context);
-                let Some(known_import) = self.known_imports.get(&*name) else {
-                    return;
-                };
-
-                if is_type_definition(node) {
-                    self.defined_known_imports.insert(name.into_owned());
-                    return;
-                }
-
-                if matches!(
-                    known_import,
-                    KnownImportSpec::GenericType { .. }
-                ) && node.parent().unwrap().kind() != GenericType {
-                    return;
-                }
-
-                self.referenced_known_imports.entry(name.into_owned())
-                    .or_default()
-                    .push(node);
-            },
-            "
-              (identifier) @c
-            " => |node, context| {
-                let name = node.text(context);
-                if let Some(known_trait_imports) = self.known_traits.get(&*name) {
-                    if let Some(full_imported_path) = get_use_import_path(node, context) {
-                        if known_trait_imports.contains(&full_imported_path) {
-                            self.imported_known_traits.insert(
-                                full_imported_path,
-                                node,
-                            );
-                        }
-                    }
-                }
-
-                let Some(known_import) = self.known_imports.get(&*name) else {
-                    return;
-                };
-
-                if is_use_import(node) {
-                    self.imported_known_imports.insert(name.into_owned(), node);
-                    return;
-                }
-
-                match known_import {
-                    KnownImportSpec::Macro { .. } => {
-                        if is_macro_invocation_name(node)
-                        {
-                            self.referenced_known_imports.entry(name.into_owned())
-                                .or_default()
-                                .push(node);
-                        }
-                    }
-                    KnownImportSpec::Attribute { .. } => {
-                        if is_attribute(node, context)
-                        {
-                            self.referenced_known_imports.entry(name.into_owned())
-                                .or_default()
-                                .push(node);
-                        }
-                    }
-                    _ => {
-                        if is_beginning_of_path(node) || is_in_attribute_value(node, context)
-                        {
-                            self.referenced_known_imports.entry(name.into_owned())
-                                .or_default()
-                                .push(node);
-                        }
-                    }
-                }
-            },
-            "
               (call_expression
                 function: (field_expression
                   field: (field_identifier) @c
@@ -350,52 +281,79 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
                 self.referenced_known_traits.entry(full_trait_path).or_default().push(node);
             },
             "source_file:exit" => |node, context| {
-                self.referenced_known_imports.iter().filter(|(referenced_known_import, _)| {
-                    !self.defined_known_imports.contains(*referenced_known_import) &&
-                        !self.imported_known_imports.contains_key(*referenced_known_import)
-                }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
-                    references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
-                }).into_iter().for_each(|(name, references)| {
-                    for (index, &reference) in references.iter().enumerate() {
-                        context.report(violation! {
-                            node => reference,
-                            message_id => "not_defined",
-                            data => {
-                                name => name,
-                            },
-                            fix => |fixer| {
-                                if index != 0 {
-                                    return;
+                let scope_analyzer = context.retrieve::<ScopeAnalyzer<'a>>();
+
+                // println!("through: {:#?}", scope_analyzer.root_scope().through().collect_vec());
+                let mut already_added: HashSet<*const KnownImportSpec> = Default::default();
+                for reference in scope_analyzer.root_scope().through() {
+                    let reference_node = reference.node();
+                    let name = reference_node.text(context);
+                    if let Some(known_import) = self.known_imports.get(&*name) {
+                        if is_compatible_usage_kind(&reference, known_import) {
+                            context.report(violation! {
+                                node => reference_node,
+                                message_id => "not_defined",
+                                data => {
+                                    name => name,
+                                },
+                                fix => |fixer| {
+                                    if already_added.contains(&(known_import as *const KnownImportSpec)) {
+                                        return;
+                                    }
+
+                                    insert_import(fixer, &name, known_import, node, context);
                                 }
-
-                                insert_import(fixer, name, &self.known_imports[name], node, context);
-                            }
-                        });
+                            });
+                            already_added.insert(known_import);
+                        }
                     }
-                });
+                }
+                // self.referenced_known_imports.iter().filter(|(referenced_known_import, _)| {
+                //     !self.defined_known_imports.contains(*referenced_known_import) &&
+                //         !self.imported_known_imports.contains_key(*referenced_known_import)
+                // }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
+                //     references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
+                // }).into_iter().for_each(|(name, references)| {
+                //     for (index, &reference) in references.iter().enumerate() {
+                //         context.report(violation! {
+                //             node => reference,
+                //             message_id => "not_defined",
+                //             data => {
+                //                 name => name,
+                //             },
+                //             fix => |fixer| {
+                //                 if index != 0 {
+                //                     return;
+                //                 }
 
-                self.referenced_known_traits.iter().filter(|(referenced_known_trait, _)| {
-                    !self.imported_known_traits.contains_key(*referenced_known_trait)
-                }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
-                    references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
-                }).into_iter().for_each(|(name, references)| {
-                    for (index, &reference) in references.iter().enumerate() {
-                        context.report(violation! {
-                            node => reference,
-                            message_id => "trait_not_in_scope",
-                            data => {
-                                name => name,
-                            },
-                            fix => |fixer| {
-                                if index != 0 {
-                                    return;
-                                }
+                //                 insert_import(fixer, name, &self.known_imports[name], node, context);
+                //             }
+                //         });
+                //     }
+                // });
 
-                                insert_import(fixer, name, &self.known_imports[&*reference.text(context)], node, context);
-                            }
-                        });
-                    }
-                });
+                // self.referenced_known_traits.iter().filter(|(referenced_known_trait, _)| {
+                //     !self.imported_known_traits.contains_key(*referenced_known_trait)
+                // }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
+                //     references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
+                // }).into_iter().for_each(|(name, references)| {
+                //     for (index, &reference) in references.iter().enumerate() {
+                //         context.report(violation! {
+                //             node => reference,
+                //             message_id => "trait_not_in_scope",
+                //             data => {
+                //                 name => name,
+                //             },
+                //             fix => |fixer| {
+                //                 if index != 0 {
+                //                     return;
+                //                 }
+
+                //                 insert_import(fixer, name, &self.known_imports[&*reference.text(context)], node, context);
+                //             }
+                //         });
+                //     }
+                // });
             }
         ]
     }
@@ -403,16 +361,26 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
 
 #[cfg(test)]
 mod tests {
+    use crate::get_instance_provider_factory;
+
     use super::*;
 
     use serde_json::json;
     use tree_sitter_lint::{
         get_tokens, rule_tests, tree_sitter::Parser, tree_sitter_grep::SupportedLanguage,
-        RuleTester,
+        RuleTester, squalid::run_once,
     };
+
+    fn tracing_subscribe() {
+        run_once! {
+            tracing_subscriber::fmt::init();
+        }
+    }
 
     #[test]
     fn test_generic_type() {
+        tracing_subscribe();
+
         let id_options = json!({
             "known_imports": {
                 "Id": {
@@ -430,7 +398,7 @@ mod tests {
                 }
             }
         });
-        RuleTester::run(
+        RuleTester::run_with_from_file_run_context_instance_provider(
             known_imports_rule(),
             rule_tests! {
                 valid => [
@@ -523,11 +491,14 @@ struct Foo {
                     },
                 ]
             },
+            get_instance_provider_factory(),
         );
     }
 
     #[test]
     fn test_simple_type() {
+        tracing_subscribe();
+
         let id_options = json!({
             "known_imports": {
                 "Id": {
@@ -545,7 +516,7 @@ struct Foo {
                 }
             }
         });
-        RuleTester::run(
+        RuleTester::run_with_from_file_run_context_instance_provider(
             known_imports_rule(),
             rule_tests! {
                 valid => [
@@ -651,11 +622,14 @@ let x = Id::Something;
                     },
                 ]
             },
+            get_instance_provider_factory()
         );
     }
 
     #[test]
     fn test_trait_method() {
+        tracing_subscribe();
+
         let trait_method_options = json!({
             "known_imports": {
                 "method": {
@@ -665,7 +639,7 @@ let x = Id::Something;
                 }
             }
         });
-        RuleTester::run(
+        RuleTester::run_with_from_file_run_context_instance_provider(
             known_imports_rule(),
             rule_tests! {
                 valid => [
@@ -730,6 +704,7 @@ fn whee() {
                     },
                 ]
             },
+            get_instance_provider_factory()
         );
     }
 
@@ -741,6 +716,8 @@ fn whee() {
 
     #[test]
     fn test_get_use_import_path() {
+        tracing_subscribe();
+
         [
             ("use bar;", "bar"),
             ("use foo::bar;", "foo::bar"),
@@ -776,6 +753,8 @@ fn whee() {
 
     #[test]
     fn test_derive() {
+        tracing_subscribe();
+
         let id_options = json!({
             "known_imports": {
                 "Id": {
@@ -784,7 +763,7 @@ fn whee() {
                 }
             }
         });
-        RuleTester::run(
+        RuleTester::run_with_from_file_run_context_instance_provider(
             known_imports_rule(),
             rule_tests! {
                 valid => [
@@ -815,11 +794,14 @@ struct Foo {}
                     },
                 ]
             },
+            get_instance_provider_factory(),
         );
     }
 
     #[test]
     fn test_macro() {
+        tracing_subscribe();
+
         let id_options = json!({
             "known_imports": {
                 "id": {
@@ -828,7 +810,7 @@ struct Foo {}
                 }
             }
         });
-        RuleTester::run(
+        RuleTester::run_with_from_file_run_context_instance_provider(
             known_imports_rule(),
             rule_tests! {
                 valid => [
@@ -862,11 +844,14 @@ fn whee() {
                     },
                 ]
             },
+            get_instance_provider_factory(),
         );
     }
 
     #[test]
     fn test_multiple_fixes() {
+        tracing_subscribe();
+
         let id_options = json!({
             "known_imports": {
                 "Id": {
@@ -879,7 +864,7 @@ fn whee() {
                 },
             }
         });
-        RuleTester::run(
+        RuleTester::run_with_from_file_run_context_instance_provider(
             known_imports_rule(),
             rule_tests! {
                 valid => [
@@ -919,11 +904,14 @@ struct Foo {
                     },
                 ]
             },
+            get_instance_provider_factory(),
         );
     }
 
     #[test]
     fn test_attribute() {
+        tracing_subscribe();
+
         let id_options = json!({
             "known_imports": {
                 "id": {
@@ -932,7 +920,7 @@ struct Foo {
                 }
             }
         });
-        RuleTester::run(
+        RuleTester::run_with_from_file_run_context_instance_provider(
             known_imports_rule(),
             rule_tests! {
                 valid => [
@@ -963,6 +951,7 @@ fn whee() {}
                     },
                 ]
             },
+            get_instance_provider_factory(),
         );
     }
 }
