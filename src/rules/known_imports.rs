@@ -7,16 +7,13 @@ use std::{
 use itertools::Itertools;
 use serde::Deserialize;
 use tree_sitter_lint::{
-    rule,
-    squalid::{EverythingExt, VecExt},
-    tree_sitter::Node,
-    violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
+    rule, squalid::VecExt, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule,
+    SourceTextProvider,
 };
-use tree_sitter_lint_plugin_rust_scope_analysis::{ScopeAnalyzer, Reference, UsageKind};
+use tree_sitter_lint_plugin_rust_scope_analysis::{Reference, ScopeAnalyzer, UsageKind};
 
 use crate::kind::{
-    Attribute, GenericType, Identifier, MacroInvocation, ScopedIdentifier, ScopedUseList,
-    StructItem, TokenTree, UseAsClause, UseDeclaration, UseList,
+    ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList,
 };
 
 #[derive(Deserialize)]
@@ -29,7 +26,7 @@ type KnownImports = HashMap<String, KnownImportSpec>;
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum KnownImportSpec {
-    TypeIdentifier {
+    Type {
         module: String,
         name: Option<String>,
     },
@@ -51,7 +48,7 @@ enum KnownImportSpec {
 impl KnownImportSpec {
     pub fn name(&self) -> Option<&str> {
         match self {
-            Self::TypeIdentifier { name, .. } => name.as_deref(),
+            Self::Type { name, .. } => name.as_deref(),
             Self::Macro { name, .. } => name.as_deref(),
             Self::Attribute { name, .. } => name.as_deref(),
             _ => None,
@@ -60,26 +57,11 @@ impl KnownImportSpec {
 
     pub fn module(&self) -> &str {
         match self {
-            Self::TypeIdentifier { module, .. } => module,
+            Self::Type { module, .. } => module,
             Self::TraitMethod { module, .. } => module,
             Self::Macro { module, .. } => module,
             Self::Attribute { module, .. } => module,
         }
-    }
-}
-
-fn is_use_import(node: Node) -> bool {
-    let mut current_node = node;
-    loop {
-        let parent = current_node.parent().unwrap();
-        match parent.kind() {
-            UseAsClause => return current_node == parent.field("alias"),
-            UseList => return true,
-            ScopedIdentifier => (),
-            UseDeclaration => return true,
-            _ => return false,
-        }
-        current_node = parent;
     }
 }
 
@@ -169,62 +151,13 @@ fn insert_import(
     }
 }
 
-fn is_type_definition(node: Node) -> bool {
-    let parent = node.parent().unwrap();
-    match parent.kind() {
-        StructItem => parent.field("name") == node,
-        _ => false,
-    }
-}
-
-fn is_beginning_of_path(node: Node) -> bool {
-    let mut current_node = node;
-    while current_node.kind() == Identifier {
-        let parent = current_node.parent().unwrap();
-        if parent.kind() == ScopedIdentifier
-            && parent.child_by_field_name("path") == Some(current_node)
-        {
-            return true;
-        }
-        current_node = parent;
-    }
-    false
-}
-
-fn is_in_attribute_value(node: Node, context: &QueryMatchContext) -> bool {
-    let mut current_node = node;
-    loop {
-        let parent = current_node.parent().unwrap();
-        match parent.kind() {
-            TokenTree => (),
-            Attribute => return parent.first_non_comment_named_child(context) != current_node,
-            _ => return false,
-        }
-        current_node = parent;
-    }
-}
-
-fn is_macro_invocation_name(node: Node) -> bool {
-    node.parent()
-        .unwrap()
-        .thrush(|parent| parent.kind() == MacroInvocation && node == parent.field("macro"))
-}
-
-fn is_attribute(node: Node, context: &QueryMatchContext) -> bool {
-    node.parent().unwrap().thrush(|parent| {
-        parent.kind() == Attribute && parent.first_non_comment_named_child(context) == node
-    })
-}
-
-fn is_compatible_usage_kind(
-    reference: &Reference,
-    known_import: &KnownImportSpec,
-) -> bool {
-    match (reference.usage_kind(), known_import) {
-        (UsageKind::IdentifierReference, KnownImportSpec::TypeIdentifier { .. }) => true,
-        (UsageKind::AttributeName, KnownImportSpec::Attribute { .. }) => true,
-        _ => false,
-    }
+fn is_compatible_usage_kind(reference: &Reference, known_import: &KnownImportSpec) -> bool {
+    matches!(
+        (reference.usage_kind(), known_import),
+        (UsageKind::IdentifierReference, KnownImportSpec::Type { .. })
+            | (UsageKind::AttributeName, KnownImportSpec::Attribute { .. })
+            | (UsageKind::Macro, KnownImportSpec::Macro { .. })
+    )
 }
 
 pub fn known_imports_rule() -> Arc<dyn Rule> {
@@ -256,10 +189,7 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
             known_imports: KnownImports = options.known_imports,
 
             [per-file-run]
-            defined_known_imports: HashSet<String>,
-            imported_known_imports: HashMap<String, Node<'a>>,
             imported_known_traits: HashMap<FullTraitPath, Node<'a>>,
-            referenced_known_imports: HashMap<String, Vec<Node<'a>>>,
             referenced_known_traits: HashMap<FullTraitPath, Vec<Node<'a>>>,
         },
         listeners => [
@@ -280,12 +210,27 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
 
                 self.referenced_known_traits.entry(full_trait_path).or_default().push(node);
             },
+            "
+              (identifier) @c
+            " => |node, context| {
+                let name = node.text(context);
+                if let Some(known_trait_imports) = self.known_traits.get(&*name) {
+                    if let Some(full_imported_path) = get_use_import_path(node, context) {
+                        if known_trait_imports.contains(&full_imported_path) {
+                            self.imported_known_traits.insert(
+                                full_imported_path,
+                                node,
+                            );
+                        }
+                    }
+                }
+            },
             "source_file:exit" => |node, context| {
                 let scope_analyzer = context.retrieve::<ScopeAnalyzer<'a>>();
 
-                // println!("through: {:#?}", scope_analyzer.root_scope().through().collect_vec());
                 let mut already_added: HashSet<*const KnownImportSpec> = Default::default();
-                for reference in scope_analyzer.root_scope().through() {
+                let root_scope = scope_analyzer.root_scope();
+                for reference in root_scope.through() {
                     let reference_node = reference.node();
                     let name = reference_node.text(context);
                     if let Some(known_import) = self.known_imports.get(&*name) {
@@ -308,52 +253,29 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
                         }
                     }
                 }
-                // self.referenced_known_imports.iter().filter(|(referenced_known_import, _)| {
-                //     !self.defined_known_imports.contains(*referenced_known_import) &&
-                //         !self.imported_known_imports.contains_key(*referenced_known_import)
-                // }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
-                //     references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
-                // }).into_iter().for_each(|(name, references)| {
-                //     for (index, &reference) in references.iter().enumerate() {
-                //         context.report(violation! {
-                //             node => reference,
-                //             message_id => "not_defined",
-                //             data => {
-                //                 name => name,
-                //             },
-                //             fix => |fixer| {
-                //                 if index != 0 {
-                //                     return;
-                //                 }
 
-                //                 insert_import(fixer, name, &self.known_imports[name], node, context);
-                //             }
-                //         });
-                //     }
-                // });
+                self.referenced_known_traits.iter().filter(|(referenced_known_trait, _)| {
+                    !self.imported_known_traits.contains_key(*referenced_known_trait)
+                }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
+                    references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
+                }).into_iter().for_each(|(name, references)| {
+                    for (index, &reference) in references.iter().enumerate() {
+                        context.report(violation! {
+                            node => reference,
+                            message_id => "trait_not_in_scope",
+                            data => {
+                                name => name,
+                            },
+                            fix => |fixer| {
+                                if index != 0 {
+                                    return;
+                                }
 
-                // self.referenced_known_traits.iter().filter(|(referenced_known_trait, _)| {
-                //     !self.imported_known_traits.contains_key(*referenced_known_trait)
-                // }).collect_vec().and_sort_by(|(_, references_a), (_, references_b)| {
-                //     references_a[0].range().start_byte.cmp(&references_b[0].range().start_byte)
-                // }).into_iter().for_each(|(name, references)| {
-                //     for (index, &reference) in references.iter().enumerate() {
-                //         context.report(violation! {
-                //             node => reference,
-                //             message_id => "trait_not_in_scope",
-                //             data => {
-                //                 name => name,
-                //             },
-                //             fix => |fixer| {
-                //                 if index != 0 {
-                //                     return;
-                //                 }
-
-                //                 insert_import(fixer, name, &self.known_imports[&*reference.text(context)], node, context);
-                //             }
-                //         });
-                //     }
-                // });
+                                insert_import(fixer, name, &self.known_imports[&*reference.text(context)], node, context);
+                            }
+                        });
+                    }
+                });
             }
         ]
     }
@@ -367,8 +289,8 @@ mod tests {
 
     use serde_json::json;
     use tree_sitter_lint::{
-        get_tokens, rule_tests, tree_sitter::Parser, tree_sitter_grep::SupportedLanguage,
-        RuleTester, squalid::run_once,
+        get_tokens, rule_tests, squalid::run_once, tree_sitter::Parser,
+        tree_sitter_grep::SupportedLanguage, RuleTester,
     };
 
     fn tracing_subscribe() {
@@ -385,7 +307,7 @@ mod tests {
             "known_imports": {
                 "Id": {
                     "module": "foo",
-                    "kind": "generic_type",
+                    "kind": "type",
                 }
             }
         });
@@ -393,7 +315,7 @@ mod tests {
             "known_imports": {
                 "Id": {
                     "module": "foo",
-                    "kind": "generic_type",
+                    "kind": "type",
                     "name": "Index",
                 }
             }
@@ -503,7 +425,7 @@ struct Foo {
             "known_imports": {
                 "Id": {
                     "module": "foo",
-                    "kind": "type_identifier",
+                    "kind": "type",
                 }
             }
         });
@@ -511,7 +433,7 @@ struct Foo {
             "known_imports": {
                 "Id": {
                     "module": "foo",
-                    "kind": "type_identifier",
+                    "kind": "type",
                     "name": "Index",
                 }
             }
@@ -622,7 +544,7 @@ let x = Id::Something;
                     },
                 ]
             },
-            get_instance_provider_factory()
+            get_instance_provider_factory(),
         );
     }
 
@@ -704,7 +626,7 @@ fn whee() {
                     },
                 ]
             },
-            get_instance_provider_factory()
+            get_instance_provider_factory(),
         );
     }
 
@@ -759,7 +681,7 @@ fn whee() {
             "known_imports": {
                 "Id": {
                     "module": "foo",
-                    "kind": "type_identifier",
+                    "kind": "type",
                 }
             }
         });
@@ -856,11 +778,11 @@ fn whee() {
             "known_imports": {
                 "Id": {
                     "module": "foo",
-                    "kind": "type_identifier",
+                    "kind": "type",
                 },
                 "Idz": {
                     "module": "bar",
-                    "kind": "type_identifier",
+                    "kind": "type",
                 },
             }
         });
