@@ -7,14 +7,15 @@ use std::{
 use itertools::Itertools;
 use serde::Deserialize;
 use tree_sitter_lint::{
-    rule, squalid::VecExt, tree_sitter::Node, violation, Fixer, NodeExt, QueryMatchContext, Rule,
-    SourceTextProvider,
+    range_between_starts, rule,
+    squalid::{EverythingExt, VecExt},
+    tree_sitter::Node,
+    tree_sitter_grep::SupportedLanguage,
+    violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
 };
 use tree_sitter_lint_plugin_rust_scope_analysis::{Reference, ScopeAnalyzer, UsageKind};
 
-use crate::kind::{
-    ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList,
-};
+use crate::kind::{ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList};
 
 #[derive(Deserialize)]
 struct Options {
@@ -173,12 +174,51 @@ fn is_compatible_usage_kind(reference: &Reference, known_import: &KnownImportSpe
     matches!(
         (reference.usage_kind(), known_import),
         (UsageKind::IdentifierReference, KnownImportSpec::Type { .. })
-            | (UsageKind::IdentifierReference, KnownImportSpec::Static { .. })
-            | (UsageKind::IdentifierReference, KnownImportSpec::Function { .. })
-            | (UsageKind::IdentifierReference, KnownImportSpec::Module { .. })
+            | (
+                UsageKind::IdentifierReference,
+                KnownImportSpec::Static { .. }
+            )
+            | (
+                UsageKind::IdentifierReference,
+                KnownImportSpec::Function { .. }
+            )
+            | (
+                UsageKind::IdentifierReference,
+                KnownImportSpec::Module { .. }
+            )
             | (UsageKind::AttributeName, KnownImportSpec::Attribute { .. })
             | (UsageKind::Macro, KnownImportSpec::Macro { .. })
     )
+}
+
+fn remove_from_use_declaration<'a>(
+    node: Node<'a>,
+    fixer: &mut Fixer,
+    context: &QueryMatchContext<'a, '_>,
+) {
+    let mut prev_ancestor = node;
+    if node.ancestors().any(|ancestor| {
+        if ancestor.kind() == UseList
+            && ancestor.num_non_comment_named_children(SupportedLanguage::Rust) > 1
+        {
+            return true;
+        }
+        prev_ancestor = ancestor;
+        false
+    }) {
+        let mut range = prev_ancestor.range();
+        if let Some(following_comma) = context
+            .get_token_after(prev_ancestor, Option::<fn(Node) -> bool>::None)
+            .when(|token| token.kind() == ",")
+        {
+            let token_after_comma =
+                context.get_token_after(following_comma, Option::<fn(Node) -> bool>::None);
+            range = range_between_starts(range, token_after_comma.range());
+        }
+        fixer.remove_range(range);
+    } else {
+        fixer.remove(node.next_ancestor_of_kind(UseDeclaration));
+    }
 }
 
 pub fn known_imports_rule() -> Arc<dyn Rule> {
@@ -190,6 +230,7 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
         messages => [
             "not_defined" => "'{{name}}' is not defined.",
             "trait_not_in_scope" => "'{{name}}' is not in scope.",
+            "unused" => "'{{name}}' is not used.",
         ],
         languages => [Rust],
         concatenate_adjacent_insert_fixes => true,
@@ -297,6 +338,28 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
                         });
                     }
                 });
+
+                for variable in root_scope.variables().filter(|variable| {
+                    variable.references().next().is_none() &&
+                        variable.definition().node().kind() == UseDeclaration &&
+                        self.known_imports.get(variable.name()).filter(|known_import| {
+                            !matches!(
+                                known_import,
+                                KnownImportSpec::TraitMethod { .. }
+                            )
+                        }).is_some()
+                }) {
+                    context.report(violation! {
+                        node => variable.definition().name(),
+                        message_id => "unused",
+                        data => {
+                            name => variable.name(),
+                        },
+                        fix => |fixer| {
+                            remove_from_use_declaration(variable.definition().name(), fixer, context);
+                        }
+                    });
+                }
             }
         ]
     }
@@ -1037,6 +1100,305 @@ use foo::id;
 
 fn whee() {
     id::something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_basic_removal() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::id;
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::id;
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+\nfn whee() {
+    something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_remove_nested() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo::bar",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::bar::id;
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::bar::id;
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+\nfn whee() {
+    something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_remove_alias() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                    "name": "bar",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::bar as id;
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::bar as id;
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+\nfn whee() {
+    something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_remove_others_simple() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::{id, baz};
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::{id, baz};
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+use foo::{baz};
+fn whee() {
+    something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_remove_others_alias() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                    "name": "bar",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::{bar as id, baz};
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::{bar as id, baz};
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+use foo::{baz};
+fn whee() {
+    something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_remove_others_trailing() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::{id, baz};
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::{baz, id};
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+use foo::{baz, };
+fn whee() {
+    something();
 }
                         ",
                         options => id_options,
