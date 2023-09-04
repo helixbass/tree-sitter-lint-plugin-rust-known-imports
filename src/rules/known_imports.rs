@@ -1,21 +1,19 @@
-use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use itertools::Itertools;
 use serde::Deserialize;
 use tree_sitter_lint::{
     range_between_starts, rule,
-    squalid::{EverythingExt, VecExt},
+    squalid::{EverythingExt, VecExt, OptionExt},
     tree_sitter::Node,
     tree_sitter_grep::SupportedLanguage,
     violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
 };
 use tree_sitter_lint_plugin_rust_scope_analysis::{Reference, ScopeAnalyzer, UsageKind};
 
-use crate::kind::{ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, Identifier};
+use crate::kind::{
+    Identifier, ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, ModItem,
+};
 
 #[derive(Deserialize)]
 struct Options {
@@ -319,6 +317,23 @@ fn does_import_path_match<'a>(
     true
 }
 
+fn get_innermost_shared_module_ancestor<'a>(mut nodes: impl Iterator<Item = Node<'a>>) -> Option<Node<'a>> {
+    let mut candidate_modules = nodes.next().unwrap().ancestors().filter(|ancestor| ancestor.kind() == ModItem).collect_vec();
+    candidate_modules.reverse();
+    while !candidate_modules.is_empty() {
+        let Some(node) = nodes.next() else {
+            return Some(*candidate_modules.last().unwrap());
+        };
+        let Some(first_module_ancestor) = node.ancestors().find(|ancestor| ancestor.kind() == ModItem) else {
+            return None;
+        };
+        while candidate_modules.last().matches(|&candidate_module| candidate_module != first_module_ancestor) {
+            candidate_modules.pop().unwrap();
+        }
+    }
+    None
+}
+
 pub fn known_imports_rule() -> Arc<dyn Rule> {
     type FullTraitPath = String;
 
@@ -388,29 +403,39 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
             "source_file:exit" => |node, context| {
                 let scope_analyzer = context.retrieve::<ScopeAnalyzer<'a>>();
 
-                let mut already_added: HashSet<*const KnownImportSpec> = Default::default();
                 let root_scope = scope_analyzer.root_scope();
-                for reference in root_scope.through() {
-                    let reference_node = reference.node();
-                    let name = reference_node.text(context);
-                    if let Some(known_import) = self.known_imports.get(&*name) {
-                        if is_compatible_usage_kind(&reference, known_import) {
-                            context.report(violation! {
-                                node => reference_node,
-                                message_id => "not_defined",
-                                data => {
-                                    name => name,
-                                },
-                                fix => |fixer| {
-                                    if already_added.contains(&(known_import as *const KnownImportSpec)) {
-                                        return;
-                                    }
-
-                                    insert_import(fixer, &name, known_import, node, context);
-                                }
-                            });
-                            already_added.insert(known_import);
+                let known_imports_with_unresolved_references: HashMap<Cow<'_, str>, Vec<Reference>> = root_scope.through().fold(
+                    Default::default(),
+                    |mut accum, reference| {
+                        let reference_node = reference.node();
+                        let name = reference_node.text(context);
+                        if let Some(known_import) = self.known_imports.get(&*name) {
+                            if is_compatible_usage_kind(&reference, known_import) {
+                                accum.entry(name).or_default().push(reference);
+                            }
                         }
+                        accum
+                    }
+                );
+                let mut known_imports_with_unresolved_references: Vec<(Cow<'_, str>, Vec<Reference>)> = known_imports_with_unresolved_references.into_iter().collect();
+                known_imports_with_unresolved_references.sort_by_key(|(_, references)| references[0].node().range().start_byte);
+                for (name, references) in known_imports_with_unresolved_references {
+                    let root_node = get_innermost_shared_module_ancestor(references.iter().map(|reference| reference.node())).map(|module| module.field("body")).unwrap_or(node);
+                    for (index, reference) in references.into_iter().enumerate() {
+                        context.report(violation! {
+                            node => reference.node(),
+                            message_id => "not_defined",
+                            data => {
+                                name => name,
+                            },
+                            fix => |fixer| {
+                                if index > 0 {
+                                    return;
+                                }
+
+                                insert_import(fixer, &name, &self.known_imports[&*name], root_node, context);
+                            }
+                        });
                     }
                 }
 
@@ -1524,6 +1549,62 @@ fn whee() {
 use foo::{baz, };
 fn whee() {
     something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_add_to_enclosing_module() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            mod bar {
+                                use foo::id;
+
+                                fn whee() {
+                                    id::something();
+                                }
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+mod bar {
+    fn whee() {
+        id::something();
+    }
+}
+                        ",
+                        output => "\
+mod bar {
+    use foo::id;
+
+fn whee() {
+        id::something();
+    }
 }
                         ",
                         options => id_options,
