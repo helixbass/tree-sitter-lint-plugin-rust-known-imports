@@ -47,6 +47,10 @@ enum KnownImportSpec {
         module: String,
         name: Option<String>,
     },
+    Function {
+        module: String,
+        name: Option<String>,
+    },
 }
 
 impl KnownImportSpec {
@@ -56,6 +60,7 @@ impl KnownImportSpec {
             Self::Macro { name, .. } => name.as_deref(),
             Self::Attribute { name, .. } => name.as_deref(),
             Self::Static { name, .. } => name.as_deref(),
+            Self::Function { name, .. } => name.as_deref(),
             _ => None,
         }
     }
@@ -67,6 +72,7 @@ impl KnownImportSpec {
             Self::Macro { module, .. } => module,
             Self::Attribute { module, .. } => module,
             Self::Static { module, .. } => module,
+            Self::Function { module, .. } => module,
         }
     }
 }
@@ -162,6 +168,7 @@ fn is_compatible_usage_kind(reference: &Reference, known_import: &KnownImportSpe
         (reference.usage_kind(), known_import),
         (UsageKind::IdentifierReference, KnownImportSpec::Type { .. })
             | (UsageKind::IdentifierReference, KnownImportSpec::Static { .. })
+            | (UsageKind::IdentifierReference, KnownImportSpec::Function { .. })
             | (UsageKind::AttributeName, KnownImportSpec::Attribute { .. })
             | (UsageKind::Macro, KnownImportSpec::Macro { .. })
     )
@@ -923,6 +930,56 @@ use foo::Id;
 
 fn whee() {
     let x = Id;
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_function() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "function",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::id;
+
+                            fn whee() {
+                                id();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+fn whee() {
+    id();
+}
+                        ",
+                        output => "\
+use foo::id;
+
+fn whee() {
+    id();
 }
                         ",
                         options => id_options,
