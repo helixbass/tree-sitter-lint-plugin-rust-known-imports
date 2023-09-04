@@ -15,7 +15,7 @@ use tree_sitter_lint::{
 };
 use tree_sitter_lint_plugin_rust_scope_analysis::{Reference, ScopeAnalyzer, UsageKind};
 
-use crate::kind::{ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList};
+use crate::kind::{ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, Identifier};
 
 #[derive(Deserialize)]
 struct Options {
@@ -221,6 +221,104 @@ fn remove_from_use_declaration<'a>(
     }
 }
 
+fn get_use_declaration_path_segments<'a, 'b, 'c>(
+    node: Node<'a>,
+    context: &'c QueryMatchContext<'a, 'b>,
+) -> UseDeclarationPathSegments<'a, 'b, 'c> {
+    UseDeclarationPathSegments::new(node, context)
+}
+
+struct UseDeclarationPathSegments<'a, 'b, 'c> {
+    current_node: Node<'a>,
+    previous_node: Option<Node<'a>>,
+    context: &'c QueryMatchContext<'a, 'b>,
+}
+
+impl<'a, 'b, 'c> UseDeclarationPathSegments<'a, 'b, 'c> {
+    fn new(current_node: Node<'a>, context: &'c QueryMatchContext<'a, 'b>) -> Self {
+        Self {
+            current_node,
+            context,
+            previous_node: Default::default(),
+        }
+    }
+
+    fn set_current_node_to_parent(&mut self) {
+        self.previous_node = Some(self.current_node);
+        self.current_node = self.current_node.parent().unwrap();
+    }
+
+    fn previous_node(&self) -> Node<'a> {
+        self.previous_node.unwrap()
+    }
+}
+
+impl<'a, 'b, 'c> Iterator for UseDeclarationPathSegments<'a, 'b, 'c> {
+    type Item = Cow<'a, str>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let parent = self.current_node.parent().unwrap();
+            match self.current_node.kind() {
+                UseDeclaration => return None,
+                UseAsClause | UseList => self.set_current_node_to_parent(),
+                ScopedUseList | ScopedIdentifier => {
+                    let path = self.current_node.field("path");
+                    if self.previous_node() == path {
+                        self.set_current_node_to_parent();
+                    } else {
+                        self.current_node = match path.kind() {
+                            ScopedIdentifier => path.field("name"),
+                            _ => path,
+                        };
+                        self.previous_node = None;
+                    }
+                }
+                Identifier => {
+                    if parent.kind() == UseAsClause && self.current_node == parent.field("alias") {
+                        let path = parent.field("path");
+                        self.current_node = match path.kind() {
+                            ScopedIdentifier => path.field("name"),
+                            _ => path,
+                        };
+                        continue;
+                    }
+                    let ret = Some(self.current_node.text(self.context));
+                    self.set_current_node_to_parent();
+                    return ret;
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn does_import_path_match<'a>(
+    node: Node<'a>,
+    known_import: &KnownImportSpec,
+    context: &QueryMatchContext<'a, '_>,
+) -> bool {
+    let node_name = node.text(context);
+    let mut full_path = known_import
+        .module()
+        .split("::")
+        .collect_vec()
+        .and_push(known_import.name().unwrap_or(&node_name));
+    println!("node: {node:#?}, node name: {node_name:#?}, full_path: {full_path:#?}, use declaration path segments: {:#?}",
+    get_use_declaration_path_segments(node, context).collect_vec(),
+        );
+    for path_segment in get_use_declaration_path_segments(node, context) {
+        if full_path.is_empty() {
+            return false;
+        }
+        if &*path_segment != *full_path.last().unwrap() {
+            return false;
+        }
+        full_path.pop().unwrap();
+    }
+    true
+}
+
 pub fn known_imports_rule() -> Arc<dyn Rule> {
     type FullTraitPath = String;
 
@@ -346,7 +444,7 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
                             !matches!(
                                 known_import,
                                 KnownImportSpec::TraitMethod { .. }
-                            )
+                            ) && does_import_path_match(variable.definition().name(), known_import, context)
                         }).is_some()
                 }) {
                     context.report(violation! {
@@ -1137,6 +1235,15 @@ fn whee() {
                         ",
                         options => id_options,
                     },
+                    // not same import path
+                    {
+                        code => "
+                            use bar::id;
+
+                            fn whee() {}
+                        ",
+                        options => id_options,
+                    },
                 ],
                 invalid => [
                     {
@@ -1233,6 +1340,24 @@ fn whee() {
                             fn whee() {
                                 id::something();
                             }
+                        ",
+                        options => id_options,
+                    },
+                    // non-matching alias
+                    {
+                        code => "
+                            use foo::baz as id;
+
+                            fn whee() {}
+                        ",
+                        options => id_options,
+                    },
+                    // no alias
+                    {
+                        code => "
+                            use foo::id;
+
+                            fn whee() {}
                         ",
                         options => id_options,
                     },
