@@ -302,9 +302,6 @@ fn does_import_path_match<'a>(
         .split("::")
         .collect_vec()
         .and_push(known_import.name().unwrap_or(&node_name));
-    println!("node: {node:#?}, node name: {node_name:#?}, full_path: {full_path:#?}, use declaration path segments: {:#?}",
-    get_use_declaration_path_segments(node, context).collect_vec(),
-        );
     for path_segment in get_use_declaration_path_segments(node, context) {
         if full_path.is_empty() {
             return false;
