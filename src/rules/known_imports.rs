@@ -12,7 +12,7 @@ use tree_sitter_lint::{
 use tree_sitter_lint_plugin_rust_scope_analysis::{Reference, ScopeAnalyzer, UsageKind};
 
 use crate::kind::{
-    Identifier, ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, ModItem,
+    Identifier, ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, ModItem, Crate, Self_, Super,
 };
 
 #[derive(Deserialize)]
@@ -272,7 +272,7 @@ impl<'a, 'b, 'c> Iterator for UseDeclarationPathSegments<'a, 'b, 'c> {
                         self.previous_node = None;
                     }
                 }
-                Identifier => {
+                Identifier | Crate | Self_ | Super => {
                     if parent.kind() == UseAsClause && self.current_node == parent.field("alias") {
                         let path = parent.field("path");
                         self.current_node = match path.kind() {
