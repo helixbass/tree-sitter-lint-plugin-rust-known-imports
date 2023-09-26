@@ -12,7 +12,7 @@ use tree_sitter_lint::{
 use tree_sitter_lint_plugin_rust_scope_analysis::{Reference, ScopeAnalyzer, UsageKind};
 
 use crate::kind::{
-    Identifier, ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, ModItem, Crate, Self_, Super,
+    Identifier, ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, ModItem, Crate, Self_, Super, VisibilityModifier,
 };
 
 #[derive(Deserialize)]
@@ -462,6 +462,7 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
                 for variable in root_scope.variables().filter(|variable| {
                     variable.references().next().is_none() &&
                         variable.definition().node().kind() == UseDeclaration &&
+                        variable.definition().node().first_non_comment_named_child(SupportedLanguage::Rust).kind() != VisibilityModifier &&
                         self.known_imports.get(variable.name()).filter(|known_import| {
                             !matches!(
                                 known_import,
@@ -1602,6 +1603,51 @@ mod bar {
 fn whee() {
         id::something();
     }
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_dont_remove_pub_use() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            pub use foo::id;
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::id;
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+\nfn whee() {
+    something();
 }
                         ",
                         options => id_options,

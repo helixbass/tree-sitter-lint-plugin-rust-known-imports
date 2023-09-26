@@ -16,3 +16,4 @@ pub const TokenTree: &str = "token_tree";
 pub const UseAsClause: &str = "use_as_clause";
 pub const UseDeclaration: &str = "use_declaration";
 pub const UseList: &str = "use_list";
+pub const VisibilityModifier: &str = "visibility_modifier";
