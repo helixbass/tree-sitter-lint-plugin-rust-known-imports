@@ -1658,4 +1658,104 @@ fn whee() {
             get_instance_provider_factory(),
         );
     }
+
+    #[test]
+    fn test_self_used() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::id::{self};
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::id::{not_self};
+fn whee() {
+    id::something();
+}
+                        ",
+                        output => "\
+use foo::id::{not_self};
+use foo::id;
+fn whee() {
+    id::something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
+
+    #[test]
+    fn test_self_unused() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "id": {
+                    "module": "foo",
+                    "kind": "module",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::id::{self};
+
+                            fn whee() {
+                                id::something();
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+use foo::id::{self};
+fn whee() {
+    something();
+}
+                        ",
+                        output => "\
+\nfn whee() {
+    something();
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
 }
