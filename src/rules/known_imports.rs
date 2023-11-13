@@ -1758,4 +1758,62 @@ fn whee() {
             get_instance_provider_factory(),
         );
     }
+
+    #[test]
+    fn test_already_imported_in_nested_module() {
+        tracing_subscribe();
+
+        let id_options = json!({
+            "known_imports": {
+                "Id": {
+                    "module": "foo",
+                    "kind": "type",
+                }
+            }
+        });
+        RuleTester::run_with_from_file_run_context_instance_provider(
+            known_imports_rule(),
+            rule_tests! {
+                valid => [
+                    {
+                        code => "
+                            use foo::Id;
+
+                            fn whee(x: Id) {}
+
+                            mod bar {
+                                use foo::Id;
+
+                                fn baz(x: Id) {}
+                            }
+                        ",
+                        options => id_options,
+                    },
+                ],
+                invalid => [
+                    {
+                        code => "\
+fn whee(x: Id) {}
+
+mod bar {
+    use foo::Id;
+}
+                        ",
+                        output => "\
+use foo::Id;
+
+fn whee(x: Id) {}
+
+mod bar {
+    use foo::Id;
+}
+                        ",
+                        options => id_options,
+                        errors => 1,
+                    },
+                ]
+            },
+            get_instance_provider_factory(),
+        );
+    }
 }
