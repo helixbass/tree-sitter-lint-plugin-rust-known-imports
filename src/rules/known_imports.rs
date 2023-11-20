@@ -346,7 +346,7 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
         concatenate_adjacent_insert_fixes => true,
         options_type! => Options,
         state => {
-            [per-run]
+            [per-config]
             known_traits: HashMap<String, Vec<FullTraitPath>> = {
                 let mut known_traits: HashMap<String, Vec<FullTraitPath>> = Default::default();
 
