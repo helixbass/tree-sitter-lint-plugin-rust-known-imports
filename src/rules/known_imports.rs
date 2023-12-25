@@ -863,7 +863,7 @@ fn whee() {
         .for_each(|(code, path)| {
             let mut parser = Parser::new();
             parser
-                .set_language(SupportedLanguage::Rust.language())
+                .set_language(SupportedLanguage::Rust.language(None))
                 .unwrap();
             let tree = parser.parse(code, None).unwrap();
             assert_eq!(
