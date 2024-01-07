@@ -4,7 +4,7 @@ use itertools::Itertools;
 use serde::Deserialize;
 use tree_sitter_lint::{
     range_between_starts, rule,
-    squalid::{EverythingExt, VecExt, OptionExt},
+    squalid::{EverythingExt, OptionExt, VecExt},
     tree_sitter::Node,
     tree_sitter_grep::SupportedLanguage,
     violation, Fixer, NodeExt, QueryMatchContext, Rule, SourceTextProvider,
@@ -12,7 +12,8 @@ use tree_sitter_lint::{
 use tree_sitter_lint_plugin_rust_scope_analysis::{Reference, ScopeAnalyzer, UsageKind};
 
 use crate::kind::{
-    Identifier, ScopedIdentifier, ScopedUseList, UseAsClause, UseDeclaration, UseList, ModItem, Crate, Self_, Super, VisibilityModifier,
+    Crate, Identifier, ModItem, ScopedIdentifier, ScopedUseList, Self_, Super, UseAsClause,
+    UseDeclaration, UseList, VisibilityModifier,
 };
 
 #[derive(Deserialize)]
@@ -195,7 +196,7 @@ fn remove_from_use_declaration<'a>(
     context: &QueryMatchContext<'a, '_>,
 ) {
     let mut prev_ancestor = node;
-    if node.ancestors().any(|ancestor| {
+    if node.ancestors(context).any(|ancestor| {
         if ancestor.kind() == UseList
             && ancestor.num_non_comment_named_children(SupportedLanguage::Rust) > 1
         {
@@ -215,7 +216,7 @@ fn remove_from_use_declaration<'a>(
         }
         fixer.remove_range(range);
     } else {
-        fixer.remove(node.next_ancestor_of_kind(UseDeclaration));
+        fixer.remove(node.next_ancestor_of_kind(UseDeclaration, context));
     }
 }
 
@@ -314,17 +315,31 @@ fn does_import_path_match<'a>(
     true
 }
 
-fn get_innermost_shared_module_ancestor<'a>(mut nodes: impl Iterator<Item = Node<'a>>) -> Option<Node<'a>> {
-    let mut candidate_modules = nodes.next().unwrap().ancestors().filter(|ancestor| ancestor.kind() == ModItem).collect_vec();
+fn get_innermost_shared_module_ancestor<'a>(
+    mut nodes: impl Iterator<Item = Node<'a>>,
+    context: &QueryMatchContext<'a, '_>,
+) -> Option<Node<'a>> {
+    let mut candidate_modules = nodes
+        .next()
+        .unwrap()
+        .ancestors(context)
+        .filter(|ancestor| ancestor.kind() == ModItem)
+        .collect_vec();
     candidate_modules.reverse();
     while !candidate_modules.is_empty() {
         let Some(node) = nodes.next() else {
             return Some(*candidate_modules.last().unwrap());
         };
-        let Some(first_module_ancestor) = node.ancestors().find(|ancestor| ancestor.kind() == ModItem) else {
+        let Some(first_module_ancestor) = node
+            .ancestors(context)
+            .find(|ancestor| ancestor.kind() == ModItem)
+        else {
             return None;
         };
-        while candidate_modules.last().matches(|&candidate_module| candidate_module != first_module_ancestor) {
+        while candidate_modules
+            .last()
+            .matches(|&candidate_module| candidate_module != first_module_ancestor)
+        {
             candidate_modules.pop().unwrap();
         }
     }
@@ -417,7 +432,7 @@ pub fn known_imports_rule() -> Arc<dyn Rule> {
                 let mut known_imports_with_unresolved_references: Vec<(Cow<'_, str>, Vec<Reference>)> = known_imports_with_unresolved_references.into_iter().collect();
                 known_imports_with_unresolved_references.sort_by_key(|(_, references)| references[0].node().range().start_byte);
                 for (name, references) in known_imports_with_unresolved_references {
-                    let root_node = get_innermost_shared_module_ancestor(references.iter().map(|reference| reference.node())).map(|module| module.field("body")).unwrap_or(node);
+                    let root_node = get_innermost_shared_module_ancestor(references.iter().map(|reference| reference.node()), context).map(|module| module.field("body")).unwrap_or(node);
                     for (index, reference) in references.into_iter().enumerate() {
                         context.report(violation! {
                             node => reference.node(),
